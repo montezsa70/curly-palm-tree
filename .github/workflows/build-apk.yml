@@ -3,6 +3,7 @@ name: Build APK
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -10,27 +11,49 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history, so the newest zip can be told apart from older ones
 
-      - name: Unzip project
-        run: unzip -q instants-android.zip -d extracted
+      # The project is uploaded to the repo as a .zip: unpack it (the newest one if there are several).
+      - name: Unzip the project
+        run: |
+          ZIP=""; BEST=-1
+          for f in *.zip; do
+            [ -f "$f" ] || continue
+            T=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+            if [ -z "$ZIP" ] || [ "${T:-0}" -gt "$BEST" ]; then ZIP="$f"; BEST="${T:-0}"; fi
+          done
+          if [ -z "$ZIP" ]; then echo "No .zip file found in the repository root"; exit 1; fi
+          echo "Using $ZIP"
+          rm -rf extracted
+          unzip -q -o "$ZIP" -d extracted -x "__MACOSX/*"
+          SETTINGS=$(find extracted -maxdepth 3 -name settings.gradle.kts | head -1)
+          if [ -z "$SETTINGS" ]; then echo "No Gradle project found inside $ZIP"; exit 1; fi
+          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
+      # The runner already ships the Android SDK; just accept its licenses.
       - name: Accept Android SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.10.2
+          gradle-version: 8.11.1
 
       - name: Build debug APK
-        working-directory: extracted/instants
+        working-directory: ${{ env.PROJECT_DIR }}
         run: gradle assembleDebug --stacktrace
 
       - uses: actions/upload-artifact@v4
         with:
           name: instants-debug-apk
-          path: extracted/instants/app/build/outputs/apk/debug/*.apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+
+      # Builds the release variant (unsigned, no secrets) so shrinking (R8) problems show up in CI.
+      - name: Check release build
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleRelease --stacktrace
